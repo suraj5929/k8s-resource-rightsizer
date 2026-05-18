@@ -2,10 +2,12 @@
 import io
 import os
 import textwrap
+from unittest.mock import patch, MagicMock
 
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 import yaml
 
 from rightsizer.scraper import MetricScraper
@@ -97,6 +99,154 @@ def test_scraper_missing_csv_raises(tmp_path):
 def test_scraper_invalid_source():
     with pytest.raises(ValueError):
         MetricScraper(source="kafka")
+
+
+# ── Stage 1: Prometheus mode ──────────────────────────────────────────────────
+
+def _mock_get(healthy_url, cpu_result=None, mem_result=None, oom_result=None):
+    """Return a side_effect function that routes mocked responses by URL."""
+    ts = 1700000000.0
+
+    def _range_response(result):
+        m = MagicMock()
+        m.raise_for_status = MagicMock()
+        m.json.return_value = {"data": {"result": result}}
+        return m
+
+    def _instant_response(result):
+        m = MagicMock()
+        m.raise_for_status = MagicMock()
+        m.json.return_value = {"data": {"result": result}}
+        return m
+
+    default_cpu = [
+        {
+            "metric": {
+                "namespace": "prod",
+                "pod": "payment-service-abc12def9-xkvpn",
+                "container": "payment-service",
+            },
+            "values": [[ts, "0.18"], [ts + 300, "0.20"]],
+        }
+    ]
+    default_mem = [
+        {
+            "metric": {
+                "namespace": "prod",
+                "pod": "payment-service-abc12def9-xkvpn",
+                "container": "payment-service",
+            },
+            "values": [[ts, str(256 * 1024 * 1024)], [ts + 300, str(260 * 1024 * 1024)]],
+        }
+    ]
+    default_oom = []
+
+    cpu_data = cpu_result if cpu_result is not None else default_cpu
+    mem_data = mem_result if mem_result is not None else default_mem
+    oom_data = oom_result if oom_result is not None else default_oom
+
+    call_count = {"n": 0}
+
+    def side_effect(url, **kwargs):
+        if url.endswith("/-/healthy"):
+            m = MagicMock()
+            m.raise_for_status = MagicMock()
+            return m
+        if "query_range" in url:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _range_response(cpu_data)
+            return _range_response(mem_data)
+        if "/api/v1/query" in url:
+            return _instant_response(oom_data)
+        raise ValueError(f"Unexpected URL: {url}")
+
+    return side_effect
+
+
+def test_prometheus_returns_correct_schema():
+    with patch("requests.get", side_effect=_mock_get(True)):
+        scraper = MetricScraper(source="prometheus",
+                                prometheus_url="http://fake:9090",
+                                namespace_filter="prod")
+        df = scraper.fetch()
+
+    assert set(df.columns) >= {"timestamp", "workload", "namespace",
+                                "container", "cpu_cores", "memory_mib", "oom_kill"}
+    assert len(df) > 0
+    assert (df["namespace"] == "prod").all()
+
+
+def test_prometheus_strips_pod_suffix():
+    with patch("requests.get", side_effect=_mock_get(True)):
+        scraper = MetricScraper(source="prometheus",
+                                prometheus_url="http://fake:9090",
+                                namespace_filter="prod")
+        df = scraper.fetch()
+
+    # pod was "payment-service-abc12def9-xkvpn" — suffix must be stripped
+    assert (df["workload"] == "payment-service").all()
+
+
+def test_prometheus_oom_count_populated():
+    oom_result = [
+        {
+            "metric": {
+                "namespace": "prod",
+                "pod": "payment-service-abc12def9-xkvpn",
+                "container": "payment-service",
+                "reason": "OOMKilled",
+            },
+            "value": [1700000000, "3"],
+        }
+    ]
+    with patch("requests.get", side_effect=_mock_get(True, oom_result=oom_result)):
+        scraper = MetricScraper(source="prometheus",
+                                prometheus_url="http://fake:9090",
+                                namespace_filter="prod")
+        df = scraper.fetch()
+
+    # OOM count from Prometheus is > 0 → all rows for this workload flagged as 1
+    assert df["oom_kill"].sum() > 0
+    assert df["oom_kill"].max() == 1  # capped to binary flag
+
+
+def test_prometheus_empty_results_raise():
+    with patch("requests.get", side_effect=_mock_get(True, cpu_result=[], mem_result=[])):
+        scraper = MetricScraper(source="prometheus", prometheus_url="http://fake:9090")
+        with pytest.raises(ValueError, match="No CPU or memory metrics"):
+            scraper.fetch()
+
+
+def test_prometheus_connection_error_raises():
+    with patch("requests.get",
+               side_effect=requests.exceptions.ConnectionError("refused")):
+        scraper = MetricScraper(source="prometheus",
+                                prometheus_url="http://unreachable:9090")
+        with pytest.raises(ConnectionError, match="Cannot connect to Prometheus"):
+            scraper.fetch()
+
+
+def test_strip_pod_suffix_deployment():
+    assert MetricScraper._strip_pod_suffix("payment-service-7d9f4b5c9-xkvpn") == "payment-service"
+
+
+def test_strip_pod_suffix_statefulset():
+    assert MetricScraper._strip_pod_suffix("postgres-0") == "postgres"
+
+
+def test_strip_pod_suffix_no_suffix():
+    assert MetricScraper._strip_pod_suffix("standalone") == "standalone"
+
+
+def test_extract_workload_prefers_deployment_label():
+    labels = {"deployment": "my-app", "pod": "my-app-abc12def9-xkvpn", "namespace": "prod"}
+    assert MetricScraper._extract_workload(labels) == "my-app"
+
+
+def test_extract_workload_falls_back_to_pod():
+    labels = {"pod": "my-app-abc12def9-xkvpn", "namespace": "prod"}
+    assert MetricScraper._extract_workload(labels) == "my-app"
 
 
 # ── Stage 2: features ─────────────────────────────────────────────────────────
