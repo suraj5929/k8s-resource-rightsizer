@@ -12,7 +12,7 @@ import yaml
 
 from rightsizer.scraper import MetricScraper
 from rightsizer.features import engineer_features
-from rightsizer.model import fit_and_predict
+from rightsizer.model import fit_and_predict, attach_series
 from rightsizer.recommender import (
     compute_recommendations,
     MIN_CPU_REQUEST_CORES,
@@ -270,6 +270,42 @@ def test_features_oom_count_positive(features_df):
 
 
 # ── Stage 3: model ────────────────────────────────────────────────────────────
+
+def test_attach_series_adds_series_columns(raw_df, features_df):
+    enriched = attach_series(features_df, raw_df)
+    assert "_cpu_series" in enriched.columns
+    assert "_mem_series" in enriched.columns
+    # every workload should have a non-empty array
+    assert all(len(s) > 0 for s in enriched["_cpu_series"])
+    assert all(len(s) > 0 for s in enriched["_mem_series"])
+
+
+def test_quantile_regressor_used_for_trending_workload(raw_df):
+    """Trending workload with attached series should use QuantileRegressor."""
+    import numpy as np
+    # Build a strongly trending workload (slope >> TREND_THRESHOLD)
+    n = 100
+    timestamps = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+    cpu = np.linspace(0.1, 2.0, n)   # clear upward trend
+    mem = np.linspace(100, 500, n)
+    df = pd.DataFrame({
+        "timestamp":  timestamps,
+        "workload":   "trending-svc",
+        "namespace":  "prod",
+        "container":  "trending-svc",
+        "cpu_cores":  cpu,
+        "memory_mib": mem,
+        "oom_kill":   0,
+    })
+    features = engineer_features(df)
+    enriched = attach_series(features, df)
+    result = fit_and_predict(enriched)
+
+    row = result.iloc[0]
+    # Prediction must be above the raw p95 (QuantileRegressor or linear projection)
+    assert row["cpu_request_pred"] >= row["cpu_p95"]
+    assert row["mem_request_pred"] >= row["mem_p95"]
+
 
 def test_model_adds_prediction_columns(model_df):
     for col in ("cpu_request_pred", "cpu_limit_pred", "mem_request_pred", "mem_limit_pred"):

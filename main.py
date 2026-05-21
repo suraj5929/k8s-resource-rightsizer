@@ -14,7 +14,7 @@ import pandas as pd
 
 from rightsizer.scraper import MetricScraper
 from rightsizer.features import engineer_features
-from rightsizer.model import fit_and_predict
+from rightsizer.model import fit_and_predict, attach_series
 from rightsizer.recommender import compute_recommendations
 from rightsizer.patcher import render_patches
 
@@ -53,6 +53,7 @@ def main(source, data_dir, prometheus_url, lookback_days,
     features_df = engineer_features(raw_df)
 
     click.echo("[3/5] Fitting model / predicting ceilings")
+    features_df = attach_series(features_df, raw_df)
     model_df = fit_and_predict(features_df)
 
     click.echo("[4/5] Computing recommendations")
