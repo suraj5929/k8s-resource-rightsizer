@@ -27,6 +27,7 @@ rightsizer/
 
 ## Dataset Schema
 
+
 ### `data/metrics.csv`
 | Column | Type | Description |
 |---|---|---|
